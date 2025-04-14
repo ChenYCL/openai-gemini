@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import keyManager from './keyManager';
 
 export default {
   async fetch (request) {
@@ -10,8 +11,13 @@ export default {
       return new Response(err.message, fixCors({ status: err.status ?? 500 }));
     };
     try {
+      // 获取用户传入的密钥
       const auth = request.headers.get("Authorization");
-      const apiKey = auth?.split(" ")[1];
+      const userApiKey = auth?.split(" ")[1];
+      
+      // 如果用户提供了API密钥，则使用它；否则从密钥池中获取一个
+      const apiKey = userApiKey || keyManager.getNextKey();
+      
       const assert = (success) => {
         if (!success) {
           throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
@@ -21,15 +27,15 @@ export default {
       switch (true) {
         case pathname.endsWith("/chat/completions"):
           assert(request.method === "POST");
-          return handleCompletions(await request.json(), apiKey)
+          return handleCompletions(await request.json(), apiKey, !userApiKey)
             .catch(errHandler);
         case pathname.endsWith("/embeddings"):
           assert(request.method === "POST");
-          return handleEmbeddings(await request.json(), apiKey)
+          return handleEmbeddings(await request.json(), apiKey, !userApiKey)
             .catch(errHandler);
         case pathname.endsWith("/models"):
           assert(request.method === "GET");
-          return handleModels(apiKey)
+          return handleModels(apiKey, !userApiKey)
             .catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
@@ -75,138 +81,177 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
-async function handleModels (apiKey) {
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
-    headers: makeHeaders(apiKey),
-  });
-  let { body } = response;
-  if (response.ok) {
-    const { models } = JSON.parse(await response.text());
-    body = JSON.stringify({
-      object: "list",
-      data: models.map(({ name }) => ({
-        id: name.replace("models/", ""),
-        object: "model",
-        created: 0,
-        owned_by: "",
-      })),
-    }, null, "  ");
+// 处理API密钥错误的辅助函数
+async function tryWithKeyManagement(apiCall, apiKey, isFromPool) {
+  try {
+    return await apiCall(apiKey);
+  } catch (error) {
+    // 如果是速率限制错误且密钥来自池，尝试将其标记为失效
+    if (error.status === 429 && isFromPool) {
+      keyManager.markKeyAsFailedTemporarily(apiKey);
+      
+      // 如果还有其他密钥可用，可以尝试使用新密钥重试一次
+      if (keyManager.keys.length > 0) {
+        const newKey = keyManager.getNextKey();
+        return await apiCall(newKey);
+      }
+    }
+    throw error;
   }
-  return new Response(body, fixCors(response));
+}
+
+async function handleModels(apiKey, isFromPool) {
+  return tryWithKeyManagement(async (key) => {
+    const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
+      headers: makeHeaders(key),
+    });
+    
+    if (!response.ok) {
+      throw new HttpError(await response.text(), response.status);
+    }
+    
+    let { body } = response;
+    if (response.ok) {
+      const { models } = JSON.parse(await response.text());
+      body = JSON.stringify({
+        object: "list",
+        data: models.map(({ name }) => ({
+          id: name.replace("models/", ""),
+          object: "model",
+          created: 0,
+          owned_by: "",
+        })),
+      }, null, "  ");
+    }
+    return new Response(body, fixCors(response));
+  }, apiKey, isFromPool);
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
-async function handleEmbeddings (req, apiKey) {
-  if (typeof req.model !== "string") {
-    throw new HttpError("model is not specified", 400);
-  }
-  let model;
-  if (req.model.startsWith("models/")) {
-    model = req.model;
-  } else {
-    if (!req.model.startsWith("gemini-")) {
-      req.model = DEFAULT_EMBEDDINGS_MODEL;
+async function handleEmbeddings(req, apiKey, isFromPool) {
+  return tryWithKeyManagement(async (key) => {
+    if (typeof req.model !== "string") {
+      throw new HttpError("model is not specified", 400);
     }
-    model = "models/" + req.model;
-  }
-  if (!Array.isArray(req.input)) {
-    req.input = [ req.input ];
-  }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify({
-      "requests": req.input.map(text => ({
-        model,
-        content: { parts: { text } },
-        outputDimensionality: req.dimensions,
-      }))
-    })
-  });
-  let { body } = response;
-  if (response.ok) {
-    const { embeddings } = JSON.parse(await response.text());
-    body = JSON.stringify({
-      object: "list",
-      data: embeddings.map(({ values }, index) => ({
-        object: "embedding",
-        index,
-        embedding: values,
-      })),
-      model: req.model,
-    }, null, "  ");
-  }
-  return new Response(body, fixCors(response));
+    let model;
+    if (req.model.startsWith("models/")) {
+      model = req.model;
+    } else {
+      if (!req.model.startsWith("gemini-")) {
+        req.model = DEFAULT_EMBEDDINGS_MODEL;
+      }
+      model = "models/" + req.model;
+    }
+    if (!Array.isArray(req.input)) {
+      req.input = [ req.input ];
+    }
+    const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
+      method: "POST",
+      headers: makeHeaders(key, { "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        "requests": req.input.map(text => ({
+          model,
+          content: { parts: { text } },
+          outputDimensionality: req.dimensions,
+        }))
+      })
+    });
+    
+    if (!response.ok) {
+      throw new HttpError(await response.text(), response.status);
+    }
+    
+    let { body } = response;
+    if (response.ok) {
+      const { embeddings } = JSON.parse(await response.text());
+      body = JSON.stringify({
+        object: "list",
+        data: embeddings.map(({ values }, index) => ({
+          object: "embedding",
+          index,
+          embedding: values,
+        })),
+        model: req.model,
+      }, null, "  ");
+    }
+    return new Response(body, fixCors(response));
+  }, apiKey, isFromPool);
 }
 
 const DEFAULT_MODEL = "gemini-2.0-flash";
-async function handleCompletions (req, apiKey) {
-  let model = DEFAULT_MODEL;
-  switch (true) {
-    case typeof req.model !== "string":
-      break;
-    case req.model.startsWith("models/"):
-      model = req.model.substring(7);
-      break;
-    case req.model.startsWith("gemini-"):
-    case req.model.startsWith("gemma-"):
-    case req.model.startsWith("learnlm-"):
-      model = req.model;
-  }
-  let body = await transformRequest(req);
-  switch (true) {
-    case model.endsWith(":search"):
-      model = model.substring(0, model.length - 7);
-      // eslint-disable-next-line no-fallthrough
-    case req.model.endsWith("-search-preview"):
-      body.tools = body.tools || [];
-      body.tools.push({googleSearch: {}});
-  }
-  const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; }
-  const response = await fetch(url, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(body),
-  });
-
-  body = response.body;
-  if (response.ok) {
-    let id = "chatcmpl-" + generateId(); //"chatcmpl-8pMMaqXMK68B3nyDBrapTDrhkHBQK";
-    const shared = {};
-    if (req.stream) {
-      body = response.body
-        .pipeThrough(new TextDecoderStream())
-        .pipeThrough(new TransformStream({
-          transform: parseStream,
-          flush: parseStreamFlush,
-          buffer: "",
-          shared,
-        }))
-        .pipeThrough(new TransformStream({
-          transform: toOpenAiStream,
-          flush: toOpenAiStreamFlush,
-          streamIncludeUsage: req.stream_options?.include_usage,
-          model, id, last: [],
-          shared,
-        }))
-        .pipeThrough(new TextEncoderStream());
-    } else {
-      body = await response.text();
-      try {
-        body = JSON.parse(body);
-        if (!body.candidates) {
-          throw new Error("Invalid completion object");
-        }
-      } catch (err) {
-        console.error("Error parsing response:", err);
-        return new Response(body, fixCors(response)); // output as is
-      }
-      body = processCompletionsResponse(body, model, id);
+async function handleCompletions(req, apiKey, isFromPool) {
+  return tryWithKeyManagement(async (key) => {
+    let model = DEFAULT_MODEL;
+    switch (true) {
+      case typeof req.model !== "string":
+        break;
+      case req.model.startsWith("models/"):
+        model = req.model.substring(7);
+        break;
+      case req.model.startsWith("gemini-"):
+      case req.model.startsWith("gemma-"):
+      case req.model.startsWith("learnlm-"):
+        model = req.model;
     }
-  }
-  return new Response(body, fixCors(response));
+    let body = await transformRequest(req);
+    switch (true) {
+      case model.endsWith(":search"):
+        model = model.substring(0, model.length - 7);
+        // eslint-disable-next-line no-fallthrough
+      case req.model.endsWith("-search-preview"):
+        body.tools = body.tools || [];
+        body.tools.push({googleSearch: {}});
+    }
+    const TASK = req.stream ? "streamGenerateContent" : "generateContent";
+    let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+    if (req.stream) { url += "?alt=sse"; }
+    const response = await fetch(url, {
+      method: "POST",
+      headers: makeHeaders(key, { "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok && response.status !== 200) {
+      throw new HttpError(await response.text(), response.status);
+    }
+
+    body = response.body;
+    if (response.ok) {
+      let id = "chatcmpl-" + generateId(); //"chatcmpl-8pMMaqXMK68B3nyDBrapTDrhkHBQK";
+      const shared = {};
+      if (req.stream) {
+        body = response.body
+          .pipeThrough(new TextDecoderStream())
+          .pipeThrough(new TransformStream({
+            transform: parseStream,
+            flush: parseStreamFlush,
+            buffer: "",
+            shared,
+          }))
+          .pipeThrough(new TransformStream({
+            transform: toOpenAiStream,
+            flush: toOpenAiStreamFlush,
+            streamIncludeUsage: req.stream_options?.include_usage,
+            model, id, last: [],
+            shared,
+          }))
+          .pipeThrough(new TextEncoderStream());
+      } else {
+        body = await response.text();
+        try {
+          body = JSON.parse(body);
+          if (!body.candidates) {
+            throw new Error("Invalid completion object");
+          }
+        } catch (err) {
+          console.error("Error parsing response:", err);
+          return new Response(body, fixCors(response)); // output as is
+        }
+        body = processCompletionsResponse(body, model, id);
+      }
+    }
+    return new Response(body, fixCors(response));
+  }, apiKey, isFromPool);
 }
 
 const adjustProps = (schemaPart) => {
