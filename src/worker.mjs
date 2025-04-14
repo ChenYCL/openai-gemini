@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import keyManager from './keyManager';
+import keyManager from '../keyManager';
 
 export default {
   async fetch (request) {
